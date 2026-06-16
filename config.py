@@ -19,7 +19,7 @@ COLLECTION = "annual_reports"
 LLM_MODEL = "claude-haiku-4-5-20251001"   # cheap model for all nodes
 
 # Retrieval / control knobs
-N_CANDIDATES = 20        # hybrid candidates before reranking
+N_CANDIDATES = 40        # hybrid candidates before reranking (recall headroom)
 TOP_K = 6                # reranked chunks shown to the LLM
 MAX_RETRIEVAL_RETRIES = 1
 MAX_HALLUCINATION_RETRIES = 2

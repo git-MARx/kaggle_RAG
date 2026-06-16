@@ -3,24 +3,26 @@
 from langgraph.graph import END, START, StateGraph
 
 from pipeline.nodes import (analyze_query, check_hallucination, compare,
-                           expand_query, finalize, generate, grade, rerank,
-                           retrieve, route_after_analyze, route_after_generate,
-                           route_grade, route_hallucination)
+                           expand_query, finalize, formulate_query, generate,
+                           grade, rerank, retrieve, route_after_analyze,
+                           route_after_generate, route_grade, route_hallucination)
 from pipeline.state import AgentState
 
 
 def build_app():
     g = StateGraph(AgentState)
 
-    for name, fn in [("analyze", analyze_query), ("retrieve", retrieve),
-                     ("rerank", rerank), ("grade", grade), ("expand", expand_query),
-                     ("generate", generate), ("hallucination", check_hallucination),
+    for name, fn in [("analyze", analyze_query), ("formulate", formulate_query),
+                     ("retrieve", retrieve), ("rerank", rerank), ("grade", grade),
+                     ("expand", expand_query), ("generate", generate),
+                     ("hallucination", check_hallucination),
                      ("compare", compare), ("finalize", finalize)]:
         g.add_node(name, fn)
 
     g.add_edge(START, "analyze")
     g.add_conditional_edges("analyze", route_after_analyze,
-                            {"single": "retrieve", "compare": "compare"})
+                            {"single": "formulate", "compare": "compare"})
+    g.add_edge("formulate", "retrieve")
 
     # single-company retrieval loop
     g.add_edge("retrieve", "rerank")

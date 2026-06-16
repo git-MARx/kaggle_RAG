@@ -22,7 +22,7 @@ A friendly competition to build a RAG system that can read annual reports and an
 
 ## 2. Data
 
-Located in `../archive/`:
+Located in `data/`:
 
 - **100 annual reports**, each as both `.pdf` and pre-converted markdown:
   `EnterpriseRAG_2025_02_markdown/<sha1>/<sha1>.md` (+ extracted figure/table images).
@@ -47,86 +47,100 @@ Located in `../archive/`:
 - **`subset.json` flags ≠ boolean answers.** Found divergences (e.g. Poste Italiane `has_dividend_policy_changes=True`, but the text only acts *"in line with"* the existing policy). Use flags as hints, not truth.
 - **Units & period** are where numbers die — tables are "in millions" with multiple year-columns. Retrieval is easy; picking the right cell/unit is the hard part.
 
+### Refinements found via the dev set (after first eval)
+Three bugs surfaced *only because* the dev set existed — each fixed:
+1. **Grounding flip on booleans** — the hallucination check rejected correct `True`s and the giveup path defaulted them to `False`. Fix: **skip the grounding check for booleans and abstentions** (a boolean is decided *from* context, not fabricated). → `route_after_generate`.
+2. **Number scale error** — the model returned the literal cell `406.1` under "(Dollars in millions)" instead of `406100000`. Fix: the `number` prompt now **scales to the base unit**. High-leverage for the 58 number questions.
+3. **Narrative retrieval miss** — the raw yes/no question (e.g. "Did X announce…in the annual report?") buried the evidence at rank ~43. Fix: a **`formulate_query` step** rewrites the question into a focused retrieval query *before* the first retrieve; `N_CANDIDATES` 20→40.
+
 ## 4. Pipeline
 
-### Ingestion
+### Ingestion (`ingestion/`, run once)
 ```
-documents (.md, assuming PDF→MD correctness)
-   → extract abbreviations (per document)
-   → enrich .md with abbreviations (inline, e.g. "CTC (cost to company)")
-   → chunk: topic/heading-based + tables as separate chunks
-   → ingest into vector store (single collection, sha1/company in metadata)
+documents (.md)
+   → extract_abbreviations.py   regex "Full Term (ABBR)" → data/abbreviations.json (per sha1)
+   → enrich.py                  inline "CTC (cost to company)" — EMBED-ONLY (enriched text is
+                                embedded; the clean text is stored as the document)
+   → chunking.py                heading-based sections + tables as standalone chunks
+                                (cells/separators compacted; big tables split with repeated header)
+   → ingest.py                  embed enriched copy into ONE Chroma collection (sha1/company/
+                                heading/is_table metadata) + pickle a BM25 corpus
 ```
 
-### Query flow
+### Query flow (`pipeline/`, LangGraph)
 
 ```mermaid
 flowchart TD
-    Q[query] --> QA[query analyser<br/>classify + extract company + read kind]
-    QA -->|chitchat / simple| LLM[llm answer]
-    LLM --> FMT
-    QA -->|medium| CF[company filter]
-    QA -->|complex| QD[query decomposition]
+    Q[question + kind] --> AN[analyze_query<br/>resolve company → sha1; route by count]
+    AN -->|single| FM[formulate_query<br/>question → focused retrieval query]
+    AN -->|compare| CMP[compare<br/>decompose · per-company retrieve+rerank+extract<br/>· normalize to EUR · pick min/max]
 
-    %% Medium path
-    CF --> R[retriever<br/>hybrid: BM25 + dense]
-    R --> GD[grade documents - CRAG]
-    GD -->|retry| QE[query expansion] --> R
-    GD -->|give up| NA[return default by kind<br/>N/A or False]
-    GD -->|correct| RR[reranker → pick top-k]
-    RR --> GEN
+    FM --> RET[retrieve<br/>hybrid BM25 + dense, sha1-filtered]
+    RET --> RR[rerank<br/>cross-encoder → top-k]
+    RR --> GR[grade — CRAG sufficiency]
+    GR -->|retry| EX[expand_query] --> RET
+    GR -->|ok / giveup| GEN[generate<br/>structured output typed by kind<br/>scales units; abstains via null]
 
-    %% Complex / comparison path
-    QD --> CFE[company filter on each sub-query]
-    CFE --> RC[retrieve per sub-query]
-    RC --> DEDUP[remove duplicates]
-    DEDUP --> GDC[grade documents - query-wise]
-    GDC -->|retry| QEC[query expansion] --> RC
-    GDC -->|give up| NA
-    GDC -->|correct| RRC[query-wise reranker → top-k from each]
-    RRC --> GEN
+    GEN -->|number / name with a value| HC[hallucination check]
+    GEN -->|boolean or N/A| FIN
+    HC -->|grounded| FIN[finalize<br/>typed value, else default-by-kind]
+    HC -->|not grounded| GEN
+    HC -->|capped| FIN
 
-    %% Generation + verification
-    GEN[generate<br/>structured output typed by kind] --> HC[hallucination check]
-    HC -->|hallucinated| GEN
-    HC -->|give up| NA
-    HC -->|grounded| FMT[format & validate by kind]
-    NA --> FMT
-    FMT --> END[end]
+    CMP --> FIN
+    FIN --> END[answer]
 ```
 
 ### Stage notes
-- **query analyser** — classifies complexity (chitchat / medium / complex), extracts the target company, and carries the answer `kind` downstream as metadata. Use a cheap model here.
-- **company filter** — resolves company → `sha1` and passes it as a hard metadata filter. For the comparison path it is applied **per decomposed sub-query** (each targets a different company).
-- **CRAG grade** — scores retrieval relevance; low score → reformulate & retry, capped → give up to the default.
-- **reranker** — cross-encoder reorders the top-k (distinct from the CRAG relevance score).
-- **generate** — constrained to emit the exact type for the question's `kind`, with the abstention rule baked into the prompt.
-- **format & validate** — final coercion to the required output shape; applies the default (`N/A` / `False`) for anything empty or unsupported. Every terminal path passes through here.
+- **analyze_query** — finds the company name(s) in the question, maps to `sha1` via `subset.json`, and routes: **`single`** (one company) or **`compare`** (multiple). Carries `kind` downstream. (No chitchat branch — every question is a knowledge question.)
+- **formulate_query** — rewrites the question into a focused, synonym-rich retrieval query. Added after the dev set showed raw yes/no questions retrieve their evidence at rank ~43.
+- **retrieve** — `HybridRetriever`: dense (Chroma) + BM25, both hard-filtered to the company's `sha1`, merged by Reciprocal Rank Fusion.
+- **rerank** — bge cross-encoder reorders candidates and keeps the top-k (this is what pulls answer-bearing tables above chatty prose).
+- **grade (CRAG)** — LLM sufficiency check; insufficient → one `expand_query` retry → else proceed (generate can still abstain).
+- **generate** — `with_structured_output(schema_for_kind)`; the `number` prompt **scales units** to the base value; missing facts come back as `null`/empty.
+- **hallucination check** — runs **only** for number/name/names that produced a concrete value (where fabrication is the risk); booleans and abstentions skip straight to finalize.
+- **finalize** — emits the typed submission value, or the kind default (`False` for boolean, `N/A` otherwise) when ungrounded/empty.
+- **compare** — for multi-company questions: decompose the metric, retrieve+rerank+extract a number per company, normalize to EUR (approximate static FX), pick min/max.
 
 ## 5. Cost / latency notes
 
-This is an **offline, accuracy-first batch pipeline** (run once over 100 questions), so it deliberately sits at the "advanced agentic RAG" end (Adaptive / Self / Corrective-RAG family) — ~4 LLM calls on a clean medium path, 6–9 on the complex path. Levers that keep it sane:
-- **Adaptive routing** — chitchat/simple skip the heavy path entirely.
-- **Cheap model** (e.g. Haiku) for auxiliary calls (classify, grade, hallucination check); strong model only for `generate`.
-- **Conditional checks** — e.g. run hallucination check only on `number`/`names` answers.
+This is an **offline, accuracy-first batch pipeline** (run once over 100 questions), so it deliberately sits at the "advanced agentic RAG" end (Adaptive / Self / Corrective-RAG family) — roughly 4–6 LLM calls per question (formulate, grade, generate, optional expand/verify), more on the compare path (one extraction per company). Models: **bge-small** embeddings, **bge-reranker-base** reranker, **Claude Haiku** for all LLM nodes. Levers that keep it sane:
+- **Cheap model** (Haiku) for every node — speed/cost over the 100-question batch.
+- **Conditional checks** — the hallucination check runs only on number/name answers that produced a value; booleans/abstentions skip it.
 
-> For a real-time chatbot this would be too heavy — you'd trim to `retrieve → rerank → generate`. The complexity is justified here because latency is irrelevant and accuracy is everything.
+> For a real-time chatbot this would be too heavy — you'd trim to `formulate → retrieve → rerank → generate`. The complexity is justified here because latency is irrelevant and accuracy is everything.
 
 ## 6. Evaluation
 
-No official answer key, so a **hand-verified dev set** lives at `../archive/dev_set_verified.json`:
-- 13 questions spanning all 4 kinds.
-- Each has the answer, a **confidence** rating, and an **exact source quote + line number** for verification against the `.md`/PDF.
+No official answer key, so a **hand-verified dev set** lives at `data/dev_set_verified.json`:
+- 13 questions spanning all 4 kinds, each with the answer, a **confidence** rating, and an **exact source quote + line number**.
 - Includes the tricky cases on purpose: 5 `N/A` abstentions, one contested boolean (Poste Italiane), one ambiguous `name` (1-800-FLOWERS).
 
-Verify the low-confidence rows manually, then use it as the measuring stick while tuning the pipeline.
+`evaluate.py` runs those questions through the graph and scores them (booleans/N-A auto-judged; numbers compared by value within 1%; names flagged for review).
 
-## 7. Status
+**Latest:** **10/13 PASS (~12/13 defensible)** — booleans 4/4, numbers 5/5 (scale-correct), one remaining miss (#29 Datalogic leadership, a scattered-narrative `names` question).
 
-Architecture finalized. Remaining build tasks:
-- [ ] Ingestion: abbreviation extraction + enrichment, heading/table-aware chunking
-- [ ] Vector store with `sha1`/company metadata + hybrid retrieval
-- [ ] Query analyser, company filter, CRAG loop, reranker
-- [ ] Query decomposition + per-sub-query filtering for comparison questions
-- [ ] Structured typed output + default-by-kind + format/validate node
-- [ ] Run against `dev_set_verified.json`
+## 7. Run
+
+```bash
+pip install -r requirements.txt
+# API key is read from ../agentic-rag/.env (ANTHROPIC_API_KEY)
+python ingestion/ingest.py        # build the index (Chroma + BM25) — run once
+python run.py --limit 3           # smoke test
+python run.py                     # full submission -> answers.json
+python evaluate.py                # score against the dev set
+```
+
+## 8. Status — implemented
+
+- [x] Ingestion: `extract_abbreviations.py`, `enrich.py` (embed-only), `chunking.py` (heading + table-aware)
+- [x] Vector store + hybrid retrieval: `ingest.py`, `retrieval/hybrid_search.py` (Chroma + BM25 + RRF), `retrieval/reranker.py`
+- [x] Pipeline: `pipeline/{state,schemas,nodes,graph}.py` (LangGraph) — analyze, formulate, retrieve, rerank, CRAG grade, generate, hallucination check, finalize
+- [x] Comparison path: decompose + per-company retrieve/extract + EUR normalize
+- [x] Structured typed output + default-by-kind
+- [x] `run.py` (submission) and `evaluate.py` (dev-set scoring)
+
+### Known gaps
+- Comparison/EUR uses **approximate static FX** (`config.FX_TO_EUR`) — a real solution needs report-period rates.
+- Scattered-narrative `names` questions (leadership changes) are the weakest area.
+- A few oversized wide-table chunks can exceed the embedder/reranker 512-token window (see `chunking.py`).

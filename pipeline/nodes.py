@@ -49,6 +49,11 @@ GRADE_TMPL = ("Question: {question}\n\nRetrieved context:\n{context}\n\n"
               "Do these chunks contain enough information to answer the question?")
 GROUNDED_TMPL = ("Context:\n{context}\n\nProposed answer: {answer}\n\n"
                  "Is the proposed answer fully supported by the context?")
+FORMULATE_TMPL = (
+    "Rewrite this annual-report question as a concise search query for retrieving the relevant "
+    "passage. Keep the key topic and entities; add likely synonyms and financial-statement terms. "
+    "DROP boilerplate ('in the annual report', 'according to', 'if not available return N/A', "
+    "'Did the company...'). Return ONLY the query.\n\nQuestion: {question}")
 EXPAND_TMPL = ("Rewrite this annual-report question into a single, more retrieval-friendly "
                "query: expand abbreviations, add likely financial-statement terms and synonyms. "
                "Return only the rewritten query.\n\nQuestion: {question}\nPrevious query: {prev}")
@@ -73,6 +78,16 @@ def analyze_query(state: dict) -> dict:
     route = "compare" if len(companies) > 1 else "single"
     return {"companies": companies, "shas": shas, "route": route,
             "query": state["question"], "retry_count": 0, "hallucination_retries": 0}
+
+
+def formulate_query(state: dict) -> dict:
+    """Turn the raw question into a focused retrieval query (run before first retrieve).
+
+    The bare yes/no/factual question retrieves poorly — boilerplate buries the
+    signal. A topic+synonym query surfaces scattered narrative evidence.
+    """
+    r = LLM.invoke(FORMULATE_TMPL.format(question=state["question"]))
+    return {"query": r.content.strip()}
 
 
 def retrieve(state: dict) -> dict:
