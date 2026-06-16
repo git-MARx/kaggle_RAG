@@ -1,0 +1,11 @@
+# Ingestion + retrieval stack
+chromadb                 # vector store (used directly, for embed-only control)
+sentence-transformers    # bge-small embeddings + bge-reranker cross-encoder
+rank-bm25                # sparse retrieval (hybrid search)
+
+# Pipeline / LLM
+langgraph                # the agent state machine
+langchain-core           # prompts / structured output plumbing
+langchain-anthropic      # ChatAnthropic (Claude)
+pydantic                 # typed answer schemas
+python-dotenv            # load ANTHROPIC_API_KEY from .env
