@@ -1,0 +1,12 @@
+{
+  "items": [
+    {
+      "q_index": 32,
+      "sha1": "b947c33b370d8a3251ef9c36ce7d71e8d16f4f8e",
+      "company": "Wheeler Real Estate Investment Trust, Inc.",
+      "question": "According to the annual report, what is the Cash flow from operations (in USD) for Wheeler Real Estate Investment Trust, Inc. (within the last period or at the end of the last period)? If data is not available, return 'N/A'.",
+      "kind": "number",
+      "answer": 30758000
+    }
+  ]
+}

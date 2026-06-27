@@ -47,15 +47,23 @@ def main(limit: int | None = None) -> None:
     subset = json.loads(SUBSET_PATH.read_text())
     if limit:
         subset = subset[:limit]
-    abbr = load_abbreviations()
+    print(f"[1/5] Loaded subset: {len(subset)} docs")
 
+    abbr = load_abbreviations()
+    print(f"[2/5] Abbreviations loaded")
+
+    print(f"[3/5] Loading embedding model '{EMBED_MODEL}' ...")
     model = SentenceTransformer(EMBED_MODEL)
+    print(f"[3/5] Model ready")
+
+    print(f"[4/5] Initialising Chroma at {CHROMA_DIR} ...")
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     try:
         client.delete_collection(COLLECTION)   # rebuild fresh each run
     except Exception:
         pass
     coll = client.create_collection(COLLECTION, metadata={"hnsw:space": "cosine"})
+    print(f"[4/5] Chroma collection '{COLLECTION}' ready")
 
     bm25_records: list[dict] = []
     buf_ids, buf_docs, buf_embs, buf_metas = [], [], [], []
@@ -67,18 +75,20 @@ def main(limit: int | None = None) -> None:
                      embeddings=buf_embs, metadatas=buf_metas)
             buf_ids.clear(); buf_docs.clear(); buf_embs.clear(); buf_metas.clear()
 
-    for rec in subset:
+    print(f"[5/5] Ingesting {len(subset)} docs ...")
+    for i, rec in enumerate(subset, 1):
         sha1 = rec["sha1"]
         company = rec.get("company_name", "")
         md_path = MD_DIR / sha1 / f"{sha1}.md"
         if not md_path.exists():
-            print(f"  [skip] missing markdown for {sha1}")
+            print(f"  [{i}/{len(subset)}] SKIP missing markdown: {sha1}")
             continue
 
+        print(f"  [{i}/{len(subset)}] {company[:40]} — chunking ...", flush=True)
         chunks = chunk_markdown(md_path.read_text(encoding="utf-8"), sha1, company)
         amap = abbr.get(sha1, {})
 
-        # Embed-only: embed the enriched copy, keep the clean chunk as the document.
+        print(f"  [{i}/{len(subset)}] {company[:40]} — embedding {len(chunks)} chunks ...", flush=True)
         enriched = [enrich_text(c["text"], amap) for c in chunks]
         vectors = model.encode(enriched, batch_size=ENCODE_BATCH,
                                normalize_embeddings=True, show_progress_bar=False)
@@ -96,7 +106,7 @@ def main(limit: int | None = None) -> None:
                                  "metadata": meta, "tokens": tokenize(enr)})
             if len(buf_ids) >= ADD_BATCH:
                 flush()
-        print(f"  {company[:30]:<32} {len(chunks):>4} chunks")
+        print(f"  [{i}/{len(subset)}] {company[:40]} — done ({len(chunks)} chunks)", flush=True)
 
     flush()
     BM25_PATH.write_bytes(pickle.dumps(bm25_records))
